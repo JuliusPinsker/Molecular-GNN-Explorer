@@ -1,17 +1,21 @@
 {
     "name": "Molecular GNN Dev Container",
     "dockerFile": "Dockerfile",
+    "runArgs": [
+        "--gpus",
+        "all"
+    ],
     "customizations": {
         "vscode": {
             "settings": {
                 "terminal.integrated.shell.linux": "/bin/bash"
-            }
+            },
+            "extensions": [
+                "ms-python.python",
+                "ms-toolsai.jupyter"
+            ]
         }
     },
-    "extensions": [
-        "ms-python.python",
-        "ms-toolsai.jupyter"
-    ],
     "postCreateCommand": "pip install -r requirements.txt",
     "mounts": [
         "source=${localWorkspaceFolder}/data,target=/workspace/data,type=bind"

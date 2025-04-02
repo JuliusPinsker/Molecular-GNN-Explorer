@@ -12,9 +12,8 @@ from torch_geometric.loader import DataLoader
 from torch_geometric.nn import GCNConv, GATConv, GINConv, global_mean_pool
 
 import neptune
-import os
 
-# Set random seed for reproducibility (updated to 69)
+# Set random seed for reproducibility
 torch.manual_seed(69)
 
 def init_neptune():
@@ -30,7 +29,7 @@ def init_neptune():
     run["parameters"] = params
     return run
 
-### Define three model classes
+### Model Definitions
 
 class GCNModel(nn.Module):
     def __init__(self, in_channels, hidden_channels):
@@ -39,6 +38,7 @@ class GCNModel(nn.Module):
         self.conv2 = GCNConv(hidden_channels, hidden_channels)
         self.lin1 = nn.Linear(hidden_channels, hidden_channels // 2)
         self.lin2 = nn.Linear(hidden_channels // 2, 1)  # Regression output for U0
+
     def forward(self, x, edge_index, batch):
         x = torch.relu(self.conv1(x, edge_index))
         x = torch.relu(self.conv2(x, edge_index))
@@ -53,6 +53,7 @@ class GATModel(nn.Module):
         self.conv2 = GATConv(hidden_channels * heads, hidden_channels, heads=1)
         self.lin1 = nn.Linear(hidden_channels, hidden_channels // 2)
         self.lin2 = nn.Linear(hidden_channels // 2, 1)
+
     def forward(self, x, edge_index, batch):
         x = torch.relu(self.conv1(x, edge_index))
         x = torch.relu(self.conv2(x, edge_index))
@@ -64,12 +65,21 @@ class GINModel(nn.Module):
     def __init__(self, in_channels, hidden_channels):
         super(GINModel, self).__init__()
         # Define a simple MLP for the GINConv
-        nn1 = nn.Sequential(nn.Linear(in_channels, hidden_channels), nn.ReLU(), nn.Linear(hidden_channels, hidden_channels))
+        nn1 = nn.Sequential(
+            nn.Linear(in_channels, hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, hidden_channels)
+        )
         self.conv1 = GINConv(nn1)
-        nn2 = nn.Sequential(nn.Linear(hidden_channels, hidden_channels), nn.ReLU(), nn.Linear(hidden_channels, hidden_channels))
+        nn2 = nn.Sequential(
+            nn.Linear(hidden_channels, hidden_channels),
+            nn.ReLU(),
+            nn.Linear(hidden_channels, hidden_channels)
+        )
         self.conv2 = GINConv(nn2)
         self.lin1 = nn.Linear(hidden_channels, hidden_channels // 2)
         self.lin2 = nn.Linear(hidden_channels // 2, 1)
+
     def forward(self, x, edge_index, batch):
         x = torch.relu(self.conv1(x, edge_index))
         x = torch.relu(self.conv2(x, edge_index))
@@ -77,7 +87,7 @@ class GINModel(nn.Module):
         x = torch.relu(self.lin1(x))
         return self.lin2(x)
 
-### Training and testing functions
+### Training, Testing, and Evaluation Functions
 
 def train(model, loader, criterion, optimizer, device):
     model.train()
@@ -85,7 +95,6 @@ def train(model, loader, criterion, optimizer, device):
     for data in loader:
         data = data.to(device)
         optimizer.zero_grad()
-        # Predict U0 (index 0 of data.y)
         target = data.y[:, 0].view(-1, 1)
         out = model(data.x, data.edge_index, data.batch)
         loss = criterion(out, target)
@@ -105,6 +114,29 @@ def test(model, loader, criterion, device):
             loss = criterion(out, target)
             total_loss += loss.item() * data.num_graphs
     return total_loss / len(loader.dataset)
+
+def evaluate_full(model, loader, device):
+    """Compute regression metrics: MSE, MAE, and R² score."""
+    model.eval()
+    all_preds = []
+    all_targets = []
+    with torch.no_grad():
+        for data in loader:
+            data = data.to(device)
+            target = data.y[:, 0].view(-1, 1)
+            out = model(data.x, data.edge_index, data.batch)
+            all_preds.append(out.cpu())
+            all_targets.append(target.cpu())
+    all_preds = torch.cat(all_preds, dim=0)
+    all_targets = torch.cat(all_targets, dim=0)
+    mse = nn.MSELoss()(all_preds, all_targets).item()
+    mae = nn.L1Loss()(all_preds, all_targets).item()
+    ss_res = torch.sum((all_targets - all_preds)**2)
+    ss_tot = torch.sum((all_targets - torch.mean(all_targets))**2)
+    r2 = 1 - ss_res / ss_tot
+    return {"MSE": mse, "MAE": mae, "R2": r2.item()}
+
+### Main Function
 
 def main():
     run = init_neptune()
@@ -127,7 +159,7 @@ def main():
     hidden_channels = 64
     epochs = 10
 
-    # Define a dictionary of models to compare
+    # Define models to compare
     models = {
         "GCN": GCNModel(in_channels, hidden_channels),
         "GAT": GATModel(in_channels, hidden_channels),
@@ -138,49 +170,50 @@ def main():
     results = {}
     loss_histories = {}
 
-    # Train and evaluate each model
     for name, model in models.items():
         print(f"\nTraining {name} model...")
         model = model.to(device)
         optimizer = optim.Adam(model.parameters(), lr=0.001)
         train_losses = []
         test_losses = []
-        for epoch in range(1, epochs+1):
+        for epoch in range(1, epochs + 1):
             t_loss = train(model, train_loader, criterion, optimizer, device)
             te_loss = test(model, test_loader, criterion, device)
             train_losses.append(t_loss)
             test_losses.append(te_loss)
             print(f"{name} - Epoch {epoch}: Train Loss: {t_loss:.4f}, Test Loss: {te_loss:.4f}")
-            # Log per-epoch test loss in Neptune under each model branch
+            # Log per-epoch loss values to Neptune
             run[f"models/{name}/train/loss"].append(t_loss)
             run[f"models/{name}/test/loss"].append(te_loss)
-        results[name] = test_losses[-1]
+        
+        # Compute additional regression metrics on the test set
+        eval_metrics = evaluate_full(model, test_loader, device)
+        results[name] = eval_metrics
         loss_histories[name] = (train_losses, test_losses)
-        # Log final loss for this model
+        run[f"models/{name}/evaluation/mse"] = eval_metrics["MSE"]
+        run[f"models/{name}/evaluation/mae"] = eval_metrics["MAE"]
+        run[f"models/{name}/evaluation/r2"] = eval_metrics["R2"]
         run[f"models/{name}/final_test_loss"] = test_losses[-1]
+        run[f"models/{name}/summary"] = (
+            f"MSE: {eval_metrics['MSE']:.4f}, "
+            f"MAE: {eval_metrics['MAE']:.4f}, "
+            f"R2: {eval_metrics['R2']:.4f}"
+        )
 
-    # Plot the test loss of each model over epochs
+    # Plot training and test loss curves for each model
     plt.figure(figsize=(10, 6))
     for name, (train_losses, test_losses) in loss_histories.items():
-        plt.plot(range(1, epochs+1), test_losses, label=f"{name} (final loss: {test_losses[-1]:.4f})")
+        plt.plot(range(1, epochs + 1), train_losses, label=f"{name} Train Loss")
+        plt.plot(range(1, epochs + 1), test_losses, label=f"{name} Test Loss", linestyle="--")
     plt.xlabel("Epoch")
-    plt.ylabel("Test MSE Loss")
-    plt.title("Comparison of Test Loss over Epochs")
+    plt.ylabel("Loss (MSE)")
+    plt.title("Train and Test Loss over Epochs")
     plt.legend()
     plt.tight_layout()
-    plot_filename = "comparison_loss.png"
+    plot_filename = "loss_curves.png"
     plt.savefig(plot_filename)
-    print("\nSaved comparison plot as", plot_filename)
-    
-    # Upload the plot to Neptune
-    run["plots/comparison_loss"].upload(plot_filename)
-    
-    # Log a dummy evaluation metric (F1 score, for demonstration)
-    run["eval/f1_score"] = 0.66
-
-    # Log final model names and performance
-    for name, loss in results.items():
-        run[f"models/{name}/summary"] = f"Final Test Loss: {loss:.4f}"
+    print("\nSaved loss curves plot as", plot_filename)
+    run["plots/loss_curves"].upload(plot_filename)
 
     run.stop()
     print("Neptune run stopped. Metrics logged.")

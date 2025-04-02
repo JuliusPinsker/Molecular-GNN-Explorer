@@ -157,7 +157,7 @@ def main():
 
     in_channels = dataset.num_node_features
     hidden_channels = 64
-    epochs = 10
+    epochs = 50
 
     # Define models to compare
     models = {
@@ -199,12 +199,13 @@ def main():
             f"MAE: {eval_metrics['MAE']:.4f}, "
             f"R2: {eval_metrics['R2']:.4f}"
         )
-
     # Plot training and test loss curves for each model
     plt.figure(figsize=(10, 6))
-    for name, (train_losses, test_losses) in loss_histories.items():
-        plt.plot(range(1, epochs + 1), train_losses, label=f"{name} Train Loss")
-        plt.plot(range(1, epochs + 1), test_losses, label=f"{name} Test Loss", linestyle="--")
+    colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+    for i, (name, (train_losses, test_losses)) in enumerate(loss_histories.items()):
+        color = colors[i % len(colors)]
+        plt.plot(range(1, epochs + 1), train_losses, label=f"{name} Train Loss", linestyle="--", color=color)
+        plt.plot(range(1, epochs + 1), test_losses, label=f"{name} Test Loss", linestyle="-", color=color)
     plt.xlabel("Epoch")
     plt.ylabel("Loss (MSE)")
     plt.title("Train and Test Loss over Epochs")

@@ -8,6 +8,11 @@ This project demonstrates a molecular engineering application using Graph Neural
 
 Each model is trained to predict the internal energy at 0K (U₀) in a regression setting. Additionally, all key hyperparameters, training losses, evaluation metrics, model summaries, and plots are tracked using Neptune.
 
+### Loss Curves Visualization
+The image below shows the training loss curves for each model, providing a quick overview of their performance during training.
+
+![Loss Curves](loss_curves.png)
+
 ## Development Environment
 This project is configured as a devcontainer so that you can open it in Visual Studio Code (or another compatible editor) with a reproducible environment. The devcontainer uses a GPU-ready PyTorch base image:
 **pytorch/pytorch:2.0.0-cuda11.7-cudnn8-runtime**
@@ -46,3 +51,6 @@ The QM9 dataset is automatically downloaded by PyTorch Geometric and cached unde
 
 ## License
 This project is provided for educational and demonstration purposes.
+```
+
+This version includes the loss curve image to immediately showcase what the repository achieves. Simply ensure that the file `loss_curves.png` is placed in the same directory as your README for the image to render correctly on GitHub or your preferred platform.

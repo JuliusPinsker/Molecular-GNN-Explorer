@@ -1,0 +1,23 @@
+{
+    "name": "Molecular GNN Dev Container",
+    "dockerFile": "Dockerfile",
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "terminal.integrated.shell.linux": "/bin/bash"
+            }
+        }
+    },
+    "extensions": [
+        "ms-python.python",
+        "ms-toolsai.jupyter"
+    ],
+    "postCreateCommand": "pip install -r requirements.txt",
+    "mounts": [
+        "source=${localWorkspaceFolder}/data,target=/workspace/data,type=bind"
+    ],
+    "remoteUser": "root",
+    "containerEnv": {
+        "NEPTUNE_API_TOKEN": "${localEnv:NEPTUNE_API_TOKEN}"
+    }
+}

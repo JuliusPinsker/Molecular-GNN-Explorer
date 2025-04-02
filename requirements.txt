@@ -7,6 +7,5 @@ torch-cluster
 torch-spline-conv
 torch-geometric
 matplotlib
-neptune-client
 neptune
 rdkit

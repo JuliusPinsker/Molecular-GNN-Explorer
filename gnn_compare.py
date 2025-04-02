@@ -146,17 +146,21 @@ def main():
 
     # Load the QM9 dataset (automatically downloaded by PyTorch Geometric)
     dataset = QM9(root='data/QM9')
-    # Use a subset for faster training (e.g., 5000 molecules)
-    dataset = dataset.shuffle()[:5000]
-    train_dataset = dataset[:4000]
-    test_dataset = dataset[4000:]
+    # Use a subset for faster training (e.g., 10000 out of the 130831 molecules)
+    # dataset = dataset.shuffle()[:10000]
+    # train_dataset = dataset[:8000]
+    # test_dataset = dataset[8000:]
+    
+    dataset = dataset.shuffle()[:130831]
+    train_dataset = dataset[:104665]
+    test_dataset = dataset[104665:]
     
     train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
     test_loader = DataLoader(test_dataset, batch_size=32, shuffle=False)
 
     in_channels = dataset.num_node_features
     hidden_channels = 64
-    epochs = 150
+    epochs = 100
 
     # Define models to compare
     models = {

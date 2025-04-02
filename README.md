@@ -50,7 +50,4 @@ The QM9 dataset is automatically downloaded by PyTorch Geometric and cached unde
 - Fey, M., & Lenssen, J. E. (2019). Fast Graph Representation Learning with PyTorch Geometric. [arXiv:1903.02428](https://arxiv.org/abs/1903.02428)
 
 ## License
-This project is provided for educational and demonstration purposes.
-```
-
-This version includes the loss curve image to immediately showcase what the repository achieves. Simply ensure that the file `loss_curves.png` is placed in the same directory as your README for the image to render correctly on GitHub or your preferred platform.
+This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.

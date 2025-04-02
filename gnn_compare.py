@@ -64,7 +64,6 @@ class GATModel(nn.Module):
 class GINModel(nn.Module):
     def __init__(self, in_channels, hidden_channels):
         super(GINModel, self).__init__()
-        # Define a simple MLP for the GINConv
         nn1 = nn.Sequential(
             nn.Linear(in_channels, hidden_channels),
             nn.ReLU(),
@@ -157,7 +156,7 @@ def main():
 
     in_channels = dataset.num_node_features
     hidden_channels = 64
-    epochs = 50
+    epochs = 150
 
     # Define models to compare
     models = {
@@ -182,23 +181,25 @@ def main():
             train_losses.append(t_loss)
             test_losses.append(te_loss)
             print(f"{name} - Epoch {epoch}: Train Loss: {t_loss:.4f}, Test Loss: {te_loss:.4f}")
-            # Log per-epoch loss values to Neptune
-            run[f"models/{name}/train/loss"].append(t_loss)
-            run[f"models/{name}/test/loss"].append(te_loss)
+            # Log generic training metrics (removed deprecated model logging)
+            run[f"training/{name}/loss"].append(t_loss)
+            run[f"training/{name}/val_loss"].append(te_loss)
         
         # Compute additional regression metrics on the test set
         eval_metrics = evaluate_full(model, test_loader, device)
         results[name] = eval_metrics
         loss_histories[name] = (train_losses, test_losses)
-        run[f"models/{name}/evaluation/mse"] = eval_metrics["MSE"]
-        run[f"models/{name}/evaluation/mae"] = eval_metrics["MAE"]
-        run[f"models/{name}/evaluation/r2"] = eval_metrics["R2"]
-        run[f"models/{name}/final_test_loss"] = test_losses[-1]
-        run[f"models/{name}/summary"] = (
+        # Log evaluation metrics under a non-model-specific key
+        run[f"evaluation/{name}/mse"] = eval_metrics["MSE"]
+        run[f"evaluation/{name}/mae"] = eval_metrics["MAE"]
+        run[f"evaluation/{name}/r2"] = eval_metrics["R2"]
+        run[f"evaluation/{name}/final_test_loss"] = test_losses[-1]
+        run[f"evaluation/{name}/summary"] = (
             f"MSE: {eval_metrics['MSE']:.4f}, "
             f"MAE: {eval_metrics['MAE']:.4f}, "
             f"R2: {eval_metrics['R2']:.4f}"
         )
+
     # Plot training and test loss curves for each model
     plt.figure(figsize=(10, 6))
     colors = plt.rcParams['axes.prop_cycle'].by_key()['color']

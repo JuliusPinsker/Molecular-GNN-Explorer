@@ -6,7 +6,9 @@ This project demonstrates a molecular engineering application using Graph Neural
 - **GAT (Graph Attention Network)**
 - **GIN (Graph Isomorphism Network)**
 
-Each model is trained to predict the internal energy at 0K (U₀) in a regression setting. Additionally, all key hyperparameters, training losses, evaluation metrics, model summaries, and plots are tracked using Neptune.
+Each model is trained to predict the internal energy at 0K (U₀) in a regression setting. Additionally, all key hyperparameters, training losses, evaluation metrics, model summaries, and plots are tracked using Neptune. 
+
+**Check out my collection of already completed experiments on the Neptune dashboard [here](https://app.neptune.ai/o/happyproject235/org/Molecular-GNN-Explorer/runs/details?viewId=standard-view&detailsTab=metadata&shortId=MOL-50&type=run&compare=EwVgNAjJUQzEA&path=parameters%2F).**
 
 ### Loss Curves Visualization
 The image below shows the training loss curves for each model, providing a quick overview of their performance during training.

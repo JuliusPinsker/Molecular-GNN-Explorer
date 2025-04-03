@@ -151,7 +151,8 @@ def main():
     # train_dataset = dataset[:8000]
     # test_dataset = dataset[8000:]
     
-    dataset = dataset.shuffle()[:130831]
+    # Use a the full dataset
+    dataset = dataset.shuffle()[:int(130831)]
     train_dataset = dataset[:104665]
     test_dataset = dataset[104665:]
     
@@ -160,7 +161,7 @@ def main():
 
     in_channels = dataset.num_node_features
     hidden_channels = 64
-    epochs = 100
+    epochs = 500
 
     # Define models to compare
     models = {

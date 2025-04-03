@@ -12,6 +12,8 @@ data/
 
 ## PyTorch
 
+.precompute
+
 .coverage
 coverage.xml
 .dmypy.json

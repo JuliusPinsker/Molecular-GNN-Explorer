@@ -1,13 +1,7 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 import os
 import math
-import random
-import pickle
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tqdm import tqdm
-
+import shutil
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,118 +9,83 @@ import matplotlib
 # Use non-interactive backend for matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
+import argparse
 
 from torch_geometric.datasets import QM9
 from torch_geometric.loader import DataLoader
-from torch_geometric.nn import (
-    GCNConv, GATConv, GINConv, global_mean_pool, MessagePassing
-)
-from torch_geometric.utils import to_undirected
-from torch_geometric.data import Data
+from torch_geometric.nn import GCNConv, GATConv, GINConv, global_mean_pool, MessagePassing
 
-import neptune  # Remove if you don't need Neptune logging.
+import neptune
+import optuna
+from optuna.samplers import TPESampler
+import optuna.visualization as vis
 
-torch.manual_seed(69)
+# ------------------------
+# Global Configuration
+# ------------------------
+CONFIG = {
+    "available_models": ["GCN", "GAT", "GIN", "PAMNet", "MXMNet"],
+    "hyperopt_ranges": {
+         "learning_rate": {"min": 1e-4, "max": 1e-2},
+         "hidden_channels": {"min": 32, "max": 128}
+    },
+    "default": {
+         "max_data_trial": 5000,        # For hyperparameter optimization
+         "max_data_training": -1,         # -1 means use the full dataset for final training
+         "trial_epochs": 1000,            # Number of epochs per trial during hyperopt
+         "training_epochs": 1000,        # Number of epochs for final training
+         "split_ratio": 0.8,
+         "batch_size": 32
+    },
+    "num_trials": 5  # Number of Optuna trials for hyperparameter optimization
+}
 
-###############################################################################
-# 1) Precompute f_i, f_j with PyTorch
-###############################################################################
+# Create temporary folder for checkpoints and plots
+TMP_FOLDER = ".tmp"
+if not os.path.exists(TMP_FOLDER):
+    os.makedirs(TMP_FOLDER)
 
-def precompute_fi_fj(data: Data) -> Data:
-    """
-    For each edge (i, j) in the graph, find:
-      - f_i: the closest neighbor of node i (excluding j),
-      - f_j: the closest neighbor of node j (excluding i),
-    and store them as data.edge_fi, data.edge_fj.
-    
-    This version uses torch.cdist(...) to compute all pairwise distances
-    at once, then picks the minimum among each node's neighbors.
-    """
-    # Ensure undirected
-    edge_index = to_undirected(data.edge_index, data.num_nodes)
-    data.edge_index = edge_index  # store back in data
-    pos = data.pos
-    num_nodes = data.num_nodes
+# ------------------------
+# Argument Parser
+# ------------------------
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Molecular GNN Explorer with Optuna Hyperparameter Optimization and Final Training"
+    )
+    parser.add_argument(
+        "--models", type=str, default="all",
+        help="Comma-separated list of models to run or 'all'"
+    )
+    parser.add_argument(
+        "--max_data_trial", type=int, default=CONFIG["default"]["max_data_trial"],
+        help="Maximum number of data points for hyperopt trials (-1 for full dataset)"
+    )
+    parser.add_argument(
+        "--max_data_training", type=int, default=CONFIG["default"]["max_data_training"],
+        help="Maximum number of data points for final training (-1 for full dataset)"
+    )
+    parser.add_argument(
+        "--trial_epochs", type=int, default=CONFIG["default"]["trial_epochs"],
+        help="Number of epochs per trial during hyperparameter optimization"
+    )
+    parser.add_argument(
+        "--training_epochs", type=int, default=CONFIG["default"]["training_epochs"],
+        help="Number of epochs for final training"
+    )
+    parser.add_argument(
+        "--batch_size", type=int, default=CONFIG["default"]["batch_size"],
+        help="Batch size for training"
+    )
+    parser.add_argument(
+        "--hyperopt", action="store_true",
+        help="Enable hyperparameter optimization using Optuna"
+    )
+    return parser.parse_args()
 
-    # Create NxN distance matrix (pure PyTorch)
-    # shape: (N, N)
-    dist_matrix = torch.cdist(pos, pos, p=2)
-
-    # Create adjacency mask from edge_index
-    adj_mask = torch.zeros(num_nodes, num_nodes, dtype=torch.bool)
-    src, dst = edge_index
-    for i, j in zip(src.tolist(), dst.tolist()):
-        adj_mask[i, j] = True
-        adj_mask[j, i] = True
-
-    fi_list = []
-    fj_list = []
-    # For each undirected edge
-    for i_, j_ in zip(src.tolist(), dst.tolist()):
-        # -- neighbors of i_, excluding j_ --
-        neighbors_i = adj_mask[i_].nonzero(as_tuple=True)[0]
-        neighbors_i = neighbors_i[neighbors_i != j_]  # exclude j_
-        if len(neighbors_i) == 0:
-            fi_list.append(i_)
-        else:
-            # among neighbors_i, pick one with min distance
-            distances_i = dist_matrix[i_, neighbors_i]
-            idx_min = torch.argmin(distances_i).item()
-            fi_list.append(neighbors_i[idx_min].item())
-
-        # -- neighbors of j_, excluding i_ --
-        neighbors_j = adj_mask[j_].nonzero(as_tuple=True)[0]
-        neighbors_j = neighbors_j[neighbors_j != i_]
-        if len(neighbors_j) == 0:
-            fj_list.append(j_)
-        else:
-            distances_j = dist_matrix[j_, neighbors_j]
-            idx_min_j = torch.argmin(distances_j).item()
-            fj_list.append(neighbors_j[idx_min_j].item())
-
-    data.edge_fi = torch.tensor(fi_list, dtype=torch.long)
-    data.edge_fj = torch.tensor(fj_list, dtype=torch.long)
-    return data
-
-def maybe_compute_fi_fj(dataset, cache_file="fi_fj_cache.pkl"):
-    """
-    Checks if 'cache_file' exists. If so, loads it (list of Data objects).
-    Otherwise, uses a ThreadPool to concurrently run precompute_fi_fj on each
-    Data object in the dataset, with a tqdm progress bar. Saves results to cache.
-
-    Returns the final list of Data objects with f_i and f_j computed.
-    """
-    if os.path.exists(cache_file):
-        print(f"[Cache] Loading from {cache_file}")
-        with open(cache_file, "rb") as f:
-            data_list = pickle.load(f)
-        return data_list
-    else:
-        print(f"[Cache] Not found: {cache_file}. Computing f_i, f_j in parallel...")
-
-        data_list = [None]*len(dataset)  # empty placeholders
-        # We'll define a helper to store results
-        def compute_one(i):
-            return i, precompute_fi_fj(dataset[i])
-
-        # Use thread pool
-        with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(compute_one, i) for i in range(len(dataset))]
-            for f in tqdm(as_completed(futures), total=len(futures), desc="Precompute fi_fj"):
-                i, d = f.result()
-                data_list[i] = d
-
-        # Save to cache
-        with open(cache_file, "wb") as f:
-            pickle.dump(data_list, f)
-        print(f"[Cache] Saved precomputed data to {cache_file}")
-        return data_list
-
-###############################################################################
-# 2) Neptune init (remove if not using)
-###############################################################################
-
-def init_neptune():
+# ------------------------
+# Neptune Initialization
+# ------------------------
+def init_neptune(additional_tags=None, extra_params=None):
     api_token = os.environ.get("NEPTUNE_API_TOKEN")
     if api_token is None:
         raise ValueError("NEPTUNE_API_TOKEN environment variable not set!")
@@ -134,15 +93,21 @@ def init_neptune():
         project="happyproject235/Molecular-GNN-Explorer",
         api_token=api_token
     )
-    # Log global hyperparameters
-    params = {"learning_rate": 0.001, "optimizer": "Adam", "seed": 69}
+    params = {"optimizer": "Adam", "seed": 69}
+    if extra_params is not None:
+        params.update(extra_params)
     run["parameters"] = params
+    if additional_tags is not None:
+        for tag in additional_tags:
+            run["sys/tags"].add(tag)
     return run
 
-###############################################################################
-# 3) Basic GNN Models (GCN, GAT, GIN)
-###############################################################################
-
+# ------------------------
+# Model Definitions
+# ------------------------
+###################################
+# Basic Models (GCN, GAT, GIN)
+###################################
 class GCNModel(nn.Module):
     def __init__(self, in_channels, hidden_channels):
         super(GCNModel, self).__init__()
@@ -198,10 +163,9 @@ class GINModel(nn.Module):
         x = torch.relu(self.lin1(x))
         return self.lin2(x)
 
-###############################################################################
-# 4) Optional More Complex Models (PAMNet, MXMNet)
-###############################################################################
-
+###################################
+# PAMNet Model
+###################################
 class PAMConv(MessagePassing):
     def __init__(self, in_channels, out_channels):
         super(PAMConv, self).__init__(aggr='add')
@@ -242,6 +206,9 @@ class PAMNetModel(nn.Module):
         x = torch.relu(self.lin1(pooled))
         return self.lin2(x)
 
+###################################
+# MXMNet Model
+###################################
 class MXMNetModel(nn.Module):
     def __init__(self, in_channels, hidden_channels):
         super(MXMNetModel, self).__init__()
@@ -251,7 +218,7 @@ class MXMNetModel(nn.Module):
         self.lin1 = nn.Linear(hidden_channels, hidden_channels // 2)
         self.lin2 = nn.Linear(hidden_channels // 2, 1)
 
-    def forward(self, x, edge_index, batch):
+    def forward(self, x, edge_index, batch, pos):
         local = torch.relu(self.local_conv(x, edge_index))
         global_ = torch.relu(self.global_conv(x, edge_index))
         combined = torch.cat([local, global_], dim=-1)
@@ -260,116 +227,20 @@ class MXMNetModel(nn.Module):
         x = torch.relu(self.lin1(pooled))
         return self.lin2(x)
 
-###############################################################################
-# 5) ComENet (Vectorized). Do geometry entirely in 'forward()'
-###############################################################################
-
-class ComENetConv(MessagePassing):
-    def __init__(self, in_channels, out_channels):
-        super().__init__(aggr='add')
-        self.lin = nn.Linear(in_channels, out_channels)
-        self.geo_mlp = nn.Sequential(
-            nn.Linear(4, out_channels),
-            nn.ReLU(),
-            nn.Linear(out_channels, out_channels)
-        )
-        self.eps = 1e-8
-
-    def forward(self, x, edge_index, pos, edge_fi, edge_fj):
-        """
-        1) Transform x with a linear layer.
-        2) Compute geometry (distance, angles, dihedral) for each edge
-           in a vectorized manner, all inside forward().
-        3) Pass geo_emb to propagate() as 'geo_emb'.
-        4) 'message()' will combine x_j with geo_emb.
-        """
-        x = self.lin(x)
-
-        # Edge indices
-        i, j = edge_index
-        # Gather positions
-        pos_i = pos[i]
-        pos_j = pos[j]
-        pos_fi_ = pos[edge_fi]
-        pos_fj_ = pos[edge_fj]
-
-        # Compute geometry
-        rel = pos_j - pos_i  # (E, 3)
-        d = torch.norm(rel, dim=-1, keepdim=True)  # (E, 1)
-
-        eps = self.eps
-        z = rel[:, 2:3]
-        r = d + eps
-        cos_theta = torch.clamp(z / r, min=-1+eps, max=1-eps)
-        theta = torch.acos(cos_theta)  # (E, 1)
-        phi = torch.atan2(rel[:, 1:2], rel[:, 0:1])  # (E, 1)
-
-        # dihedral
-        v1 = pos_i - pos_fi_
-        v2 = rel
-        v3 = pos_j - pos_fj_
-        n1 = torch.cross(v1, v2, dim=-1)
-        n2 = torch.cross(v2, v3, dim=-1)
-        n1_norm = torch.norm(n1, dim=-1) + eps
-        n2_norm = torch.norm(n2, dim=-1) + eps
-        cos_tau = torch.clamp(
-            torch.sum(n1 * n2, dim=-1) / (n1_norm * n2_norm),
-            min=-1+eps, max=1-eps
-        )
-        tau = torch.acos(cos_tau).unsqueeze(-1)
-
-        geo_features = torch.cat([d, theta, phi, tau], dim=-1)  # (E, 4)
-        geo_emb = self.geo_mlp(geo_features)                     # (E, out_channels)
-
-        # Now call propagate, passing 'geo_emb' but NOT passing 'pos'.
-        return self.propagate(edge_index, x=x, geo_emb=geo_emb)
-
-    def message(self, x_j, geo_emb):
-        """
-        Combine neighbor features x_j with geometric embedding geo_emb.
-        """
-        return x_j + geo_emb
-
-class ComENetModel(nn.Module):
-    def __init__(self, in_channels, hidden_channels):
-        super(ComENetModel, self).__init__()
-        self.conv1 = ComENetConv(in_channels, hidden_channels)
-        self.conv2 = ComENetConv(hidden_channels, hidden_channels)
-        self.self_atom = nn.Linear(hidden_channels, hidden_channels)  # self-update
-        self.lin1 = nn.Linear(hidden_channels, hidden_channels // 2)
-        self.lin2 = nn.Linear(hidden_channels // 2, 1)
-
-    def forward(self, x, edge_index, batch, pos, edge_fi, edge_fj):
-        """
-        1) Pass data into two ComENetConv layers (both do geometry).
-        2) Self-atom update, global pool.
-        3) Final MLP to get scalar output.
-        """
-        x = torch.relu(self.conv1(x, edge_index, pos, edge_fi, edge_fj))
-        x = torch.relu(self.conv2(x, edge_index, pos, edge_fi, edge_fj))
-        x = torch.relu(self.self_atom(x))
-        x = global_mean_pool(x, batch)
-        x = torch.relu(self.lin1(x))
-        return self.lin2(x)
-
-###############################################################################
-# 6) Training, Testing, Evaluation
-###############################################################################
-
+# ------------------------
+# Training and Evaluation Functions
+# ------------------------
 def train(model, loader, criterion, optimizer, device, use_pos=False):
     model.train()
     total_loss = 0
     for data in loader:
         data = data.to(device)
         optimizer.zero_grad()
-        target = data.y[:, 7].view(-1, 1)
-
+        target = data.y[:, 0].view(-1, 1)
         if use_pos:
-            out = model(data.x, data.edge_index, data.batch,
-                        data.pos, data.edge_fi, data.edge_fj)
+            out = model(data.x, data.edge_index, data.batch, data.pos)
         else:
             out = model(data.x, data.edge_index, data.batch)
-
         loss = criterion(out, target)
         loss.backward()
         optimizer.step()
@@ -383,21 +254,15 @@ def test(model, loader, criterion, device, use_pos=False):
         for data in loader:
             data = data.to(device)
             target = data.y[:, 0].view(-1, 1)
-
             if use_pos:
-                out = model(data.x, data.edge_index, data.batch,
-                            data.pos, data.edge_fi, data.edge_fj)
+                out = model(data.x, data.edge_index, data.batch, data.pos)
             else:
                 out = model(data.x, data.edge_index, data.batch)
-
             loss = criterion(out, target)
             total_loss += loss.item() * data.num_graphs
     return total_loss / len(loader.dataset)
 
 def evaluate_full(model, loader, device, use_pos=False):
-    """
-    Evaluate MSE, MAE, RMSE, R2 on the entire loader.
-    """
     model.eval()
     all_preds = []
     all_targets = []
@@ -406,151 +271,251 @@ def evaluate_full(model, loader, device, use_pos=False):
             data = data.to(device)
             target = data.y[:, 0].view(-1, 1)
             if use_pos:
-                out = model(data.x, data.edge_index, data.batch,
-                            data.pos, data.edge_fi, data.edge_fj)
+                out = model(data.x, data.edge_index, data.batch, data.pos)
             else:
                 out = model(data.x, data.edge_index, data.batch)
             all_preds.append(out.cpu())
             all_targets.append(target.cpu())
-
     all_preds = torch.cat(all_preds, dim=0)
     all_targets = torch.cat(all_targets, dim=0)
-
     mse = nn.MSELoss()(all_preds, all_targets).item()
     mae = nn.L1Loss()(all_preds, all_targets).item()
     rmse = math.sqrt(mse)
     ss_res = torch.sum((all_targets - all_preds) ** 2)
     ss_tot = torch.sum((all_targets - torch.mean(all_targets)) ** 2)
     r2 = 1 - ss_res / ss_tot
-    return {
-        "MSE": mse,
-        "MAE": mae,
-        "RMSE": rmse,
-        "R2": r2.item()
+    return {"MSE": mse, "MAE": mae, "RMSE": rmse, "R2": r2.item()}
+
+# ------------------------
+# Optuna Objective Function with Extended Neptune Tagging and Checkpointing
+# ------------------------
+def optuna_objective(trial, model_class, model_name, in_channels, device, train_loader, test_loader, use_pos, trial_epochs, max_data_trial):
+    # Extended tags for this trial
+    trial_tags = [
+        f"model:{model_name}",
+        "hyperopt",
+        "trial_phase",
+        f"optuna_trial:{trial.number}",
+        f"trial_epochs:{trial_epochs}",
+        f"max_data_trial:{max_data_trial}"
+    ]
+    extra_params = {
+        "phase": "trial",
+        "model_name": model_name,
+        "trial_number": trial.number,
+        "trial_epochs": trial_epochs,
+        "max_data_trial": max_data_trial
     }
+    trial_run = init_neptune(additional_tags=trial_tags, extra_params=extra_params)
+    
+    # Suggest hyperparameters using Bayesian optimization
+    lr = trial.suggest_float("learning_rate", 
+                             CONFIG["hyperopt_ranges"]["learning_rate"]["min"],
+                             CONFIG["hyperopt_ranges"]["learning_rate"]["max"], log=True)
+    hidden_channels = trial.suggest_int("hidden_channels",
+                                        CONFIG["hyperopt_ranges"]["hidden_channels"]["min"],
+                                        CONFIG["hyperopt_ranges"]["hidden_channels"]["max"])
+    trial_run["parameters/hyperparams"] = {"learning_rate": lr, "hidden_channels": hidden_channels}
+    
+    # Instantiate model and optimizer
+    model_instance = model_class(in_channels, hidden_channels).to(device)
+    optimizer = optim.Adam(model_instance.parameters(), lr=lr)
+    criterion = nn.MSELoss()
+    
+    best_epoch_loss = float('inf')
+    checkpoint_filename = os.path.join(TMP_FOLDER, f"checkpoint_trial_{trial.number}.pt")
+    
+    # Train for the specified number of trial epochs
+    for epoch in range(1, trial_epochs + 1):
+        t_loss = train(model_instance, train_loader, criterion, optimizer, device, use_pos)
+        te_loss = test(model_instance, test_loader, criterion, device, use_pos)
+        eval_metrics = evaluate_full(model_instance, test_loader, device, use_pos)
+        
+        # Update best checkpoint if current validation loss is lower
+        if te_loss < best_epoch_loss:
+            best_epoch_loss = te_loss
+            torch.save(model_instance, checkpoint_filename)
+        
+        # Log per-epoch metrics
+        trial_run["trial/train/loss"].append(t_loss)
+        trial_run["trial/val/loss"].append(te_loss)
+        trial_run["trial/val/mse"].append(eval_metrics["MSE"])
+        trial_run["trial/val/mae"].append(eval_metrics["MAE"])
+        trial_run["trial/val/rmse"].append(eval_metrics["RMSE"])
+        trial_run["trial/val/r2"].append(eval_metrics["R2"])
+        print(f"Trial {trial.number} - Epoch {epoch}: Train Loss: {t_loss:.4f}, Val Loss: {te_loss:.4f}")
+    
+    # Upload the best checkpoint of this trial to Neptune
+    trial_run["model_checkpoints/best_checkpoint"].upload(checkpoint_filename)
+    final_val_loss = test(model_instance, test_loader, criterion, device, use_pos)
+    trial_run["trial/final_val_loss"] = final_val_loss
+    trial_run.stop()
+    return final_val_loss
 
-###############################################################################
-# 7) Main Script
-###############################################################################
-
+# ------------------------
+# Main Training Loop
+# ------------------------
 def main():
+    args = parse_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print("Using device:", device)
-
-    # 1) Load the QM9 dataset from PyG
-    dataset = QM9(root='data/QM9')
-
-    # 2) Precompute fi_fj concurrently + cache
-    cache_path = "fi_fj_cache.pkl"
-    data_list = maybe_compute_fi_fj(dataset, cache_path)
-
-    # 3) Shuffle + slice
-    random.shuffle(data_list)
-    data_list = data_list[:130831]
-    train_list = data_list[:104665]
-    test_list = data_list[104665:]
-    # Use a subset for faster training if you want
-    # data_list = data_list[:10000]
-    # train_list = data_list[:8000]
-    # test_list = data_list[8000:]
-
-    # 4) Create DataLoaders
-    train_loader = DataLoader(train_list, batch_size=32, shuffle=True)
-    test_loader = DataLoader(test_list, batch_size=32, shuffle=False)
-
-    in_channels = dataset.num_node_features
-    hidden_channels = 64
-    epochs = 1000
-
-    # Set up your models
+    
+    # Define model groups
     base_models = {
-        "GCN": GCNModel(in_channels, hidden_channels),
-        "GAT": GATModel(in_channels, hidden_channels),
-        "GIN": GINModel(in_channels, hidden_channels)
+        "GCN": GCNModel,
+        "GAT": GATModel,
+        "GIN": GINModel
     }
     sota_models = {
-        "PAMNet": PAMNetModel(in_channels, hidden_channels),
-        "MXMNet": MXMNetModel(in_channels, hidden_channels),
-        "ComENet": ComENetModel(in_channels, hidden_channels)
+        "PAMNet": PAMNetModel,
+        "MXMNet": MXMNetModel,
     }
     all_models = {**base_models, **sota_models}
+    
+    if args.models.lower() == "all":
+        selected_models = all_models
+    else:
+        selected = [m.strip() for m in args.models.split(",")]
+        selected_models = {name: model for name, model in all_models.items() if name in selected}
 
     combined_loss_histories = {}
-    results = {}
+    final_results = {}
+    study = None  # To hold Optuna study if hyperopt enabled
 
-    for model_name, model in all_models.items():
-        print(f"\nTraining {model_name} model...")
-        run = init_neptune()  # remove if not using Neptune
-
-        # Log model name to Neptune
-        run["parameters/model_name"] = model_name
-        run["sys/tags"].add(model_name)
-
-        model = model.to(device)
-        optimizer = optim.Adam(model.parameters(), lr=0.001)
+    for model_name, model_class in selected_models.items():
+        print(f"\nProcessing model: {model_name}")
+        use_pos = model_name in ["PAMNet", "MXMNet"]
+        
+        # --------------------
+        # Hyperparameter Optimization (Trial Phase)
+        # --------------------
+        best_params = {"learning_rate": 0.001, "hidden_channels": 64}  # defaults if hyperopt is disabled
+        if args.hyperopt:
+            trial_dataset = QM9(root='data/QM9')
+            trial_dataset = trial_dataset.shuffle()
+            if args.max_data_trial != -1:
+                trial_dataset = trial_dataset[:args.max_data_trial]
+            split_ratio = CONFIG["default"]["split_ratio"]
+            train_size = int(len(trial_dataset) * split_ratio)
+            trial_train_dataset = trial_dataset[:train_size]
+            trial_test_dataset = trial_dataset[train_size:]
+            trial_train_loader = DataLoader(trial_train_dataset, batch_size=args.batch_size, shuffle=True)
+            trial_test_loader = DataLoader(trial_test_dataset, batch_size=args.batch_size, shuffle=False)
+            
+            study = optuna.create_study(sampler=TPESampler(seed=69), direction="minimize")
+            objective = lambda trial: optuna_objective(
+                trial, model_class, model_name, trial_dataset.num_node_features, device,
+                trial_train_loader, trial_test_loader, use_pos, args.trial_epochs, args.max_data_trial
+            )
+            print(f"Starting Optuna optimization for {model_name} with {CONFIG['num_trials']} trials...")
+            study.optimize(objective, n_trials=CONFIG["num_trials"])
+            best_params = study.best_params
+            best_params["hidden_channels"] = int(best_params["hidden_channels"])
+            print(f"Best hyperparameters for {model_name}: {best_params}")
+            
+            # Log summary of best hyperparameters and save Optuna plots to temp folder
+            summary_tags = [f"model:{model_name}", "hyperopt", "trial_phase", "summary"]
+            run_summary = init_neptune(additional_tags=summary_tags,
+                                        extra_params={"phase": "trial_summary", "model_name": model_name})
+            run_summary["parameters/best_hyperparams"] = best_params
+            fig_history = vis.plot_optimization_history(study)
+            fig_importance = vis.plot_param_importances(study)
+            history_path = os.path.join(TMP_FOLDER, f"{model_name}_opt_history.png")
+            importance_path = os.path.join(TMP_FOLDER, f"{model_name}_opt_param_importances.png")
+            fig_history.write_image(history_path)
+            fig_importance.write_image(importance_path)
+            run_summary["plots/optimization_history"].upload(history_path)
+            run_summary["plots/param_importances"].upload(importance_path)
+            run_summary.stop()
+        
+        # --------------------
+        # Final Training Phase
+        # --------------------
+        final_tags = [
+            f"model:{model_name}", "final_training", f"training_epochs:{args.training_epochs}",
+            f"max_data_training:{args.max_data_training}" if args.max_data_training != -1 else "full_data"
+        ]
+        run_final = init_neptune(
+            additional_tags=final_tags,
+            extra_params={"phase": "final_training", "model_name": model_name, "training_epochs": args.training_epochs}
+        )
+        
+        final_dataset = QM9(root='data/QM9')
+        final_dataset = final_dataset.shuffle()
+        if args.max_data_training != -1:
+            final_dataset = final_dataset[:args.max_data_training]
+        train_size = int(len(final_dataset) * CONFIG["default"]["split_ratio"])
+        final_train_dataset = final_dataset[:train_size]
+        final_test_dataset = final_dataset[train_size:]
+        final_train_loader = DataLoader(final_train_dataset, batch_size=args.batch_size, shuffle=True)
+        final_test_loader = DataLoader(final_test_dataset, batch_size=args.batch_size, shuffle=False)
+        
+        # If hyperopt was enabled, load the best checkpoint from the best trial.
+        if args.hyperopt and study is not None:
+            best_trial_number = study.best_trial.number
+            checkpoint_filename = os.path.join(TMP_FOLDER, f"checkpoint_trial_{best_trial_number}.pt")
+            model = torch.load(checkpoint_filename)
+            model = model.to(device)
+        else:
+            model = model_class(final_dataset.num_node_features, best_params["hidden_channels"]).to(device)
+        
+        optimizer = optim.Adam(model.parameters(), lr=best_params.get("learning_rate", 0.001))
         criterion = nn.MSELoss()
+        
         train_losses = []
         test_losses = []
-
-        # Some models (ComENet, PAMNet) need positional data
-        use_pos = model_name in ["ComENet", "PAMNet"]
-
-        for epoch in range(1, epochs + 1):
-            t_loss = train(model, train_loader, criterion, optimizer, device, use_pos)
-            te_loss = test(model, test_loader, criterion, device, use_pos)
-
+        for epoch in range(1, args.training_epochs + 1):
+            t_loss = train(model, final_train_loader, criterion, optimizer, device, use_pos)
+            te_loss = test(model, final_test_loader, criterion, device, use_pos)
             train_losses.append(t_loss)
             test_losses.append(te_loss)
-
-            # Evaluate full metrics each epoch
-            metrics = evaluate_full(model, test_loader, device, use_pos)
-
-            print(f"{model_name} - Epoch {epoch:3d}: "
-                  f"Train Loss = {t_loss:.4f}, Test Loss = {te_loss:.4f}")
-
-            # Neptune logging
-            run["training/loss"].append(t_loss)
-            run["training/val_loss"].append(te_loss)
-            run["training/metrics/mse"].append(metrics["MSE"])
-            run["training/metrics/mae"].append(metrics["MAE"])
-            run["training/metrics/rmse"].append(metrics["RMSE"])
-            run["training/metrics/r2"].append(metrics["R2"])
-
-        # Final evaluation
-        final_metrics = evaluate_full(model, test_loader, device, use_pos)
-        results[model_name] = final_metrics
+            run_final["train/loss"].append(t_loss)
+            eval_metrics = evaluate_full(model, final_test_loader, device, use_pos)
+            run_final["val/loss"].append(te_loss)
+            run_final["val/mse"].append(eval_metrics["MSE"])
+            run_final["val/mae"].append(eval_metrics["MAE"])
+            run_final["val/rmse"].append(eval_metrics["RMSE"])
+            run_final["val/r2"].append(eval_metrics["R2"])
+            print(f"{model_name} - Epoch {epoch}: Train Loss: {t_loss:.4f}, Val Loss: {te_loss:.4f}")
+        final_metrics = evaluate_full(model, final_test_loader, device, use_pos)
+        final_results[model_name] = final_metrics
         combined_loss_histories[model_name] = (train_losses, test_losses)
+        
+        # Save combined loss curves plot to temp folder and upload to final run
+        plt.figure(figsize=(10, 6))
+        colors = plt.rcParams['axes.prop_cycle'].by_key()['color']
+        for i, (m_name, (tr_losses, ts_losses)) in enumerate(combined_loss_histories.items()):
+            color = colors[i % len(colors)]
+            plt.plot(range(1, args.training_epochs + 1), tr_losses, label=f"{m_name} Train Loss", linestyle="--", color=color)
+            plt.plot(range(1, args.training_epochs + 1), ts_losses, label=f"{m_name} Test Loss", linestyle="-", color=color)
+        plt.xlabel("Epoch")
+        plt.ylabel("Loss (MSE)")
+        plt.title("Combined Train and Test Loss for Final Training Runs")
+        plt.legend()
+        plt.tight_layout()
+        combined_plot_path = os.path.join(TMP_FOLDER, "combined_loss_curves_final.png")
+        plt.savefig(combined_plot_path)
+        run_final["val/combined_loss_curves"].upload(combined_plot_path)
+        plt.close()
 
-        # Log final metrics
-        run["evaluation/mse"] = final_metrics["MSE"]
-        run["evaluation/mae"] = final_metrics["MAE"]
-        run["evaluation/rmse"] = final_metrics["RMSE"]
-        run["evaluation/r2"] = final_metrics["R2"]
-        run["evaluation/final_test_loss"] = test_losses[-1]
-        run["evaluation/summary"] = (
-            f"MSE: {final_metrics['MSE']:.4f}, "
-            f"MAE: {final_metrics['MAE']:.4f}, "
-            f"RMSE: {final_metrics['RMSE']:.4f}, "
-            f"R2: {final_metrics['R2']:.4f}"
-        )
-        run.stop()
-        print(f"Neptune run for {model_name} stopped. Metrics logged.")
-
-    # Plot combined train/test curves
-    plt.figure(figsize=(10, 6))
-    for model_name, (train_losses, test_losses) in combined_loss_histories.items():
-        plt.plot(range(1, epochs + 1), train_losses, 
-                 label=f"{model_name} Train Loss", linestyle="--")
-        plt.plot(range(1, epochs + 1), test_losses, 
-                 label=f"{model_name} Test Loss", linestyle="-")
-    plt.xlabel("Epoch")
-    plt.ylabel("Loss (MSE)")
-    plt.title("Combined Train and Test Loss for All Models")
-    plt.legend()
-    plt.tight_layout()
-    plot_filename = "combined_loss_curves.png"
-    plt.savefig(plot_filename)
-    print("\nSaved combined loss curves plot as", plot_filename)
+        # If hyperopt was enabled, also upload the Optuna plots to the final run
+        if args.hyperopt and study is not None:
+            fig_history = vis.plot_optimization_history(study)
+            fig_importance = vis.plot_param_importances(study)
+            opt_history_path = os.path.join(TMP_FOLDER, f"{model_name}_opt_history_final.png")
+            opt_importance_path = os.path.join(TMP_FOLDER, f"{model_name}_opt_param_importances_final.png")
+            fig_history.write_image(opt_history_path)
+            fig_importance.write_image(opt_importance_path)
+            run_final["val/opt_history"].upload(opt_history_path)
+            run_final["val/opt_param_importances"].upload(opt_importance_path)
+        
+        run_final.stop()
+        print(f"Final Neptune run for {model_name} stopped. Metrics logged.")
+        
+    # Delete the temporary folder after all runs are completed
+    if os.path.exists(TMP_FOLDER):
+        shutil.rmtree(TMP_FOLDER)
+        print(f"Temporary folder '{TMP_FOLDER}' deleted.")
 
 if __name__ == "__main__":
     main()

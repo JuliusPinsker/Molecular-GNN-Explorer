@@ -9,6 +9,7 @@ torch-geometric
 matplotlib
 neptune
 rdkit
-random
-pickle
-pathlib
+optuna
+plotly
+scikit-learn
+kaleido

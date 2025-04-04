@@ -11,7 +11,7 @@ data/
 # refactoring this file!
 
 ## PyTorch
-
+.temp
 .precompute
 
 .coverage

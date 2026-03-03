@@ -1,5 +1,13 @@
 # Molecular-GNN-Explorer
 
+[![Python](https://img.shields.io/badge/python-3.8%2B-blue?logo=python)](gnn_compare.py)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0-ee4c2c?logo=pytorch)](https://pytorch.org/)
+[![PyG](https://img.shields.io/badge/PyTorch_Geometric-latest-orange)](https://pyg.org/)
+[![CUDA](https://img.shields.io/badge/CUDA-11.7-green?logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
+[![DevContainer](https://img.shields.io/badge/devcontainer-ready-blue?logo=docker)](https://containers.dev/)
+[![Neptune](https://img.shields.io/badge/tracked%20with-Neptune-blueviolet)](https://app.neptune.ai/happyproject235/Molecular-GNN-Explorer/runs)
+[![License](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 > Benchmark six GNN architectures on molecular property prediction using the QM9 dataset — fully reproducible via devcontainer.
 
 ![Loss Curves](loss_curves.png)
